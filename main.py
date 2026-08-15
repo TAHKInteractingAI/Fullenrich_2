@@ -6,186 +6,189 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # =============================
-# AUTH (GOOGLE SERVICE ACCOUNT)
+# SETTINGS & FLAGS
 # =============================
-# Thiết lập quyền hạn truy cập Google Sheets & Google Drive
+
+MAIN_SHEET_ID = "1F0dU6uN3kDH1y_VYFJCyJOZpqLWGaTM6WsmnglG77qk"
+KEY_SHEET_ID  = "1wzgeUWKlXe-QU-rDZLaLjIQxeXreNvbm3Fi88UZjXWM"
+
+FULL_START  = "https://app.fullenrich.com/api/v1/contact/enrich/bulk"
+FULL_RESULT = "https://app.fullenrich.com/api/v1/contact/enrich/bulk/"
+
+TIMEOUT = 120
+POLL_INTERVAL = 5
+BATCH_SIZE = 60  # Số profile xử lý trong 1 lần gửi API
+
+# =============================
+# AUTH
+# =============================
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# Kiểm tra xem đang chạy trên GitHub Actions (dùng Environment Variable) 
-# hay chạy local (dùng file json local)
 SERVICE_ACCOUNT_FILE = "service_account.json"
-
 if os.path.exists(SERVICE_ACCOUNT_FILE):
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 else:
-    # Lấy thông tin từ GitHub Secrets (đã được cấu hình ở Bước 3)
     creds = Credentials.from_service_account_info(
         eval(os.environ["GCP_SA_KEY"]), scopes=SCOPES
     )
 
 gc = gspread.authorize(creds)
-print("Google Auth OK")
-
-# =============================
-# SHEETS
-# =============================
-MAIN_SHEET_ID = "1F0dU6uN3kDH1y_VYFJCyJOZpqLWGaTM6WsmnglG77qk"
-KEY_SHEET_ID  = "1wzgeUWKlXe-QU-rDZLaLjIQxeXreNvbm3Fi88UZjXWM"
-
 main_sheet = gc.open_by_key(MAIN_SHEET_ID).sheet1
-key_spread = gc.open_by_key(KEY_SHEET_ID)
-
-full_sheet = key_spread.worksheet("Fullenrich")
-print("Sheets Connected")
+key_sheet = gc.open_by_key(KEY_SHEET_ID).worksheet("Fullenrich")
+print(f" Connected Sheets | DRY_RUN = {DRY_RUN}")
 
 # =============================
-# API & SETTINGS
+# KEY MANAGER
 # =============================
-FULL_START  = "https://app.fullenrich.com/api/v1/contact/enrich/bulk"
-FULL_RESULT = "https://app.fullenrich.com/api/v1/contact/enrich/bulk/"
+class KeyManager:
+    def __init__(self, worksheet):
+        self.ws = worksheet
+        self.keys = []
+        self.load_keys()
 
-TIMEOUT = 90
-POLL_INTERVAL = 3
+    def load_keys(self):
+        rows = self.ws.get_all_values()
+        for idx, row in enumerate(rows[1:], start=2):
+            key = row[3].strip() if len(row) >= 4 else ""
+            status = row[4].strip() if len(row) >= 5 else ""
+            if key and status == "":
+                self.keys.append({"key": key, "row": idx})
+        print(f" Loaded {len(self.keys)} active API keys.")
+
+    def get_current_key(self):
+        return self.keys[0] if self.keys else None
+
+    def mark_current_dead(self, reason="Hết lượt"):
+        if not self.keys:
+            return
+        dead = self.keys.pop(0)
+        print(f"⚠️ Marking key at row {dead['row']} as '{reason}'")
+        self.ws.update_cell(dead["row"], 5, reason)
 
 # =============================
-# HELPERS
+# ENRICHMENT LOGIC (BULK)
 # =============================
 def is_valid_email(email):
     return bool(re.match(r"[^@]+@[^@]+\.[^@]+", str(email)))
 
-def get_full_key():
-    rows = full_sheet.get_all_values()
-    for i in range(1, len(rows)):  # Python index tính từ 0
-        key = rows[i][3] if len(rows[i]) >= 4 else ""
-        status = rows[i][4] if len(rows[i]) >= 5 else ""
+def enrich_batch(linkedin_urls, key_mgr):
+    if DRY_RUN:
+        print(f" [DRY_RUN] Giả lập tìm {len(linkedin_urls)} URLs thành công.")
+        time.sleep(2)
+        return {url: "mock_test@example.com" for url in linkedin_urls}
 
-        if key and status == "":
-            return key, i + 1  # gspread tính dòng từ 1
-    return None, None
-
-def mark_full_dead(row):
-    full_sheet.update_cell(row, 5, "Hết lượt")
-
-# =============================
-# SINGLE ENRICH
-# =============================
-def enrich_single(linkedin):
     while True:
-        key, row = get_full_key()
-        print("Key Row:", row)
-
-        if not key:
-            print("❌ No FullEnrich keys left")
-            return "No Key"
+        curr = key_mgr.get_current_key()
+        if not curr:
+            print("❌ Không còn API key khả dụng nào!")
+            return None
 
         headers = {
-            "Authorization": f"Bearer {key}",
+            "Authorization": f"Bearer {curr['key']}",
             "Content-Type": "application/json"
         }
 
         payload = {
-            "name": "linkedin_single",
-            "datas": [
-                {
-                    "linkedin_url": linkedin,
-                    "enrich_fields": ["contact.emails"]
-                }
-            ]
+            "name": f"batch_{int(time.time())}",
+            "datas": [{"linkedin_url": url, "enrich_fields": ["contact.emails"]} for url in linkedin_urls]
         }
 
         r = requests.post(FULL_START, headers=headers, json=payload)
-
+        
         if r.status_code == 401:
-            mark_full_dead(row)
+            key_mgr.mark_current_dead("Hết hạn/Sai Key")
             continue
-
+        
         if r.status_code != 200:
-            print("Start error:", r.text)
+            print(" Lỗi gửi Batch request:", r.text)
             time.sleep(5)
             continue
 
         enrich_id = r.json().get("enrichment_id")
-        start = time.time()
+        start_time = time.time()
+        results = {}
 
+        # Polling kết quả
         while True:
-            rr = requests.get(
-                FULL_RESULT + enrich_id,
-                headers={"Authorization": f"Bearer {key}"}
-            )
-
+            rr = requests.get(FULL_RESULT + enrich_id, headers={"Authorization": f"Bearer {curr['key']}"})
             data = rr.json()
             status = data.get("status", "").lower()
-            print("Status:", status)
+            print(f"Status Bulk ({len(linkedin_urls)} items): {status}")
 
             if status in ["credits_insufficient", "payment_required"]:
-                mark_full_dead(row)
-                break
+                key_mgr.mark_current_dead("Hết lượt")
+                break  # Thoát vòng lặp polling để thử key tiếp theo
 
             if status in ["finished", "completed", "success"]:
-                try:
-                    item = data["datas"][0]
-                    emails = item.get("contact", {}).get("emails", [])
-                    if not emails:
-                        emails = item.get("contact", {}).get("personal_emails", [])
-
+                items = data.get("datas", [])
+                for item in items:
+                    url = item.get("linkedin_url")
+                    emails = item.get("contact", {}).get("emails", []) or item.get("contact", {}).get("personal_emails", [])
+                    found_email = "- Not Found"
                     if emails:
-                        email = emails[0]["email"]
-                        if is_valid_email(email):
-                            return email
-                except Exception as e:
-                    print("Error parsing email:", e)
+                        e = emails[0].get("email", "")
+                        if is_valid_email(e):
+                            found_email = e
+                    results[url] = found_email
+                return results
 
-                return "- Not Found"
-
-            if time.time() - start > TIMEOUT:
-                print("Timeout → final check")
-                try:
-                    item = data["datas"][0]  # Sửa lỗi truy cập danh sách từ code cũ
-                    emails = item.get("contact", {}).get("emails", [])
-                    if not emails:
-                        emails = item.get("contact", {}).get("personal_emails", [])
-
-                    if emails:
-                        email = emails[0]["email"]
-                        if is_valid_email(email):
-                            return email
-                except Exception as e:
-                    print("Error in timeout parse:", e)
-
-                return "- Not Found"
+            if time.time() - start_time > TIMEOUT:
+                print("⏱ Timeout khi chờ kết quả batch.")
+                return {url: "- Not Found" for url in linkedin_urls}
 
             time.sleep(POLL_INTERVAL)
 
 # =============================
-# MAIN PROCESS
+# MAIN RUNNER
 # =============================
 def main():
-    rows = main_sheet.get_all_values()
-    print("Profiles loaded:", len(rows) - 1)
+    key_mgr = KeyManager(key_sheet)
+    if not key_mgr.keys and not DRY_RUN:
+        print(" Không có key để chạy.")
+        return
 
-    for i, row in enumerate(rows[1:], start=2):
-        linkedin = row[0] if len(row) > 0 else ""
-        email = row[1] if len(row) > 1 else ""
+    all_rows = main_sheet.get_all_values()
+    pending_items = []
 
-        if not linkedin:
-            continue
+    # Gom các dòng cần xử lý
+    for idx, row in enumerate(all_rows[1:], start=2):
+        linkedin = row[0].strip() if len(row) > 0 else ""
+        email = row[1].strip() if len(row) > 1 else ""
 
-        if email and email not in ["", "- Not Found"]:
-            continue
+        if linkedin and email in ["", "- Not Found"]:
+            pending_items.append({"row": idx, "url": linkedin})
 
-        print(f"\nProcessing row {i}")
-        print("LinkedIn:", linkedin)
+    print(f" Cần tìm email cho: {len(pending_items)} profiles")
 
-        result = enrich_single(linkedin)
-        main_sheet.update_cell(i, 2, result)
+    # Xử lý theo từng nhóm (Batch)
+    for i in range(0, len(pending_items), BATCH_SIZE):
+        batch = pending_items[i : i + BATCH_SIZE]
+        urls = [b["url"] for b in batch]
+        
+        print(f"\n🚀 Đang xử lý batch {i // BATCH_SIZE + 1} ({len(urls)} profile)...")
+        res_map = enrich_batch(urls, key_mgr)
 
-        print("Result:", result)
+        if res_map is None:
+            print("⛔ Dừng tiến trình do hết API Key.")
+            break
+
+        # Batch update lên Google Sheet (Tiết kiệm Quota)
+        cell_updates = []
+        for b in batch:
+            result_email = res_map.get(b["url"], "- Not Found")
+            cell_updates.append({
+                "range": f"B{b['row']}",
+                "values": [[result_email]]
+            })
+        
+        main_sheet.batch_update(cell_updates)
+        print(f" Cập nhật xong batch vào Sheet.")
         time.sleep(2)
 
-    print("\nDONE")
+    print("\n Hoàn thành toàn bộ!")
 
 if __name__ == "__main__":
     main()
