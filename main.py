@@ -8,6 +8,8 @@ from google.oauth2.service_account import Credentials
 # =============================
 # SETTINGS & FLAGS
 # =============================
+# Đặt DRY_RUN = True nếu muốn test toàn bộ luồng mà KHÔNG tiêu tốn credit FullEnrich
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "false"
 
 MAIN_SHEET_ID = "1F0dU6uN3kDH1y_VYFJCyJOZpqLWGaTM6WsmnglG77qk"
 KEY_SHEET_ID  = "1wzgeUWKlXe-QU-rDZLaLjIQxeXreNvbm3Fi88UZjXWM"
