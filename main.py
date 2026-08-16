@@ -20,6 +20,10 @@ TIMEOUT = 120
 POLL_INTERVAL = 5
 BATCH_SIZE = 50
 
+# Số lần thử lại tối đa khi gửi request hoặc poll bị lỗi (tránh loop vô hạn -> spam key)
+MAX_SEND_RETRIES = 3
+MAX_POLL_ERRORS = 3
+
 # =============================
 # AUTH
 # =============================
@@ -81,6 +85,8 @@ def enrich_batch(linkedin_urls, key_mgr):
         time.sleep(2)
         return ["mock_test@example.com"] * len(linkedin_urls)
 
+    send_retry_count = 0
+
     while True:
         curr = key_mgr.get_current_key()
         if not curr:
@@ -97,24 +103,49 @@ def enrich_batch(linkedin_urls, key_mgr):
             "datas": [{"linkedin_url": url, "enrich_fields": ["contact.emails"]} for url in linkedin_urls]
         }
 
-        r = requests.post(FULL_START, headers=headers, json=payload)
-        
+        try:
+            r = requests.post(FULL_START, headers=headers, json=payload, timeout=30)
+        except requests.exceptions.RequestException as e:
+            send_retry_count += 1
+            print(f"⚠️ Lỗi network khi gửi batch (lần {send_retry_count}/{MAX_SEND_RETRIES}): {e}")
+            if send_retry_count >= MAX_SEND_RETRIES:
+                print("❌ Vượt quá số lần thử lại cho phép (network). Bỏ qua batch này để tránh spam.")
+                return ["- Not Found"] * len(linkedin_urls)
+            time.sleep(5 * send_retry_count)
+            continue
+
         if r.status_code == 401:
             key_mgr.mark_current_dead("Hết hạn/Sai Key")
+            send_retry_count = 0  # đổi key mới -> reset đếm retry
             continue
-        
+
         if r.status_code != 200:
-            print("Lỗi gửi Batch request:", r.text)
-            time.sleep(5)
+            send_retry_count += 1
+            print(f"Lỗi gửi Batch request (lần {send_retry_count}/{MAX_SEND_RETRIES}): {r.text}")
+            if send_retry_count >= MAX_SEND_RETRIES:
+                print("❌ Vượt quá số lần thử lại cho phép. Bỏ qua batch này để tránh spam phí phạm key.")
+                return ["- Not Found"] * len(linkedin_urls)
+            time.sleep(5 * send_retry_count)
             continue
 
         enrich_id = r.json().get("enrichment_id")
         start_time = time.time()
+        poll_error_count = 0
 
         # Polling kết quả
         while True:
-            rr = requests.get(FULL_RESULT + enrich_id, headers={"Authorization": f"Bearer {curr['key']}"})
-            data = rr.json()
+            try:
+                rr = requests.get(FULL_RESULT + enrich_id, headers={"Authorization": f"Bearer {curr['key']}"}, timeout=30)
+                data = rr.json()
+            except (requests.exceptions.RequestException, ValueError) as e:
+                poll_error_count += 1
+                print(f"⚠️ Lỗi khi poll kết quả (lần {poll_error_count}/{MAX_POLL_ERRORS}): {e}")
+                if poll_error_count >= MAX_POLL_ERRORS:
+                    print("❌ Vượt quá số lần thử lại cho phép khi poll. Bỏ qua batch này.")
+                    return ["- Not Found"] * len(linkedin_urls)
+                time.sleep(POLL_INTERVAL)
+                continue
+
             status = data.get("status", "").lower()
             print(f"Status Bulk ({len(linkedin_urls)} items): {status}")
 
@@ -130,7 +161,7 @@ def enrich_batch(linkedin_urls, key_mgr):
                 for i in range(len(linkedin_urls)):
                     item = items[i] if i < len(items) else {}
                     emails = item.get("contact", {}).get("emails", []) or item.get("contact", {}).get("personal_emails", [])
-                    
+
                     found_email = "- Not Found"
                     if emails:
                         e = emails[0].get("email", "")
@@ -138,7 +169,7 @@ def enrich_batch(linkedin_urls, key_mgr):
                             found_email = e
 
                     results_list.append(found_email)
-                
+
                 return results_list
 
             if time.time() - start_time > TIMEOUT:
@@ -146,6 +177,9 @@ def enrich_batch(linkedin_urls, key_mgr):
                 return ["- Not Found"] * len(linkedin_urls)
 
             time.sleep(POLL_INTERVAL)
+
+        # Nếu vừa break do hết credit ở trên, quay lại vòng ngoài để thử key kế tiếp
+        send_retry_count = 0
 
 # =============================
 # MAIN RUNNER (FIXED)
@@ -169,12 +203,12 @@ def main():
 
     print(f"Cần tìm email cho: {len(pending_items)} profiles")
 
-    # Xử lý theo từng nhóm (Batch)
+    # Xử lý theo từng nhóm (Batch) - lặp cho đến khi hết TOÀN BỘ data đang chờ
     for i in range(0, len(pending_items), BATCH_SIZE):
         batch = pending_items[i : i + BATCH_SIZE]
         urls = [b["url"] for b in batch]
-        
-        print(f"\n🚀 Đang xử lý batch {i // BATCH_SIZE + 1} ({len(urls)} profile)...")
+
+        print(f"\n🚀 Đang xử lý batch {i // BATCH_SIZE + 1}/{(len(pending_items) - 1) // BATCH_SIZE + 1} ({len(urls)} profile)...")
         results_list = enrich_batch(urls, key_mgr)
 
         if results_list is None:
@@ -189,7 +223,7 @@ def main():
                 "range": f"B{b['row']}",
                 "values": [[result_email]]
             })
-        
+
         main_sheet.batch_update(cell_updates)
         print(f"Cập nhật xong batch vào Sheet.")
         time.sleep(2)
